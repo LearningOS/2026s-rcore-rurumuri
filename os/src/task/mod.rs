@@ -17,6 +17,7 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use alloc::vec::*;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -45,6 +46,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// record the count of each syscall, indexed by syscall_id
+    syscall_count_record: Vec<Vec<usize>>,
 }
 
 lazy_static! {
@@ -65,6 +68,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscall_count_record: alloc::vec![alloc::vec![0; 474]; MAX_APP_NUM],
                 })
             },
         }
@@ -134,6 +138,20 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Return the count of syscall with id `syscall_id` in current task.
+    pub fn get_current_task_syscall_count(&self, syscall_id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_count_record[current][syscall_id]
+    }
+
+    /// Increase the count of syscall with id `syscall_id` in current task by 1.
+    pub fn increase_current_task_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_count_record[current][syscall_id] += 1;
     }
 }
 
