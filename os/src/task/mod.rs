@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MemorySet;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -201,4 +202,36 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Get the current 'Running' task's memory set.
+pub fn current_user_memset() -> &'static mut MemorySet {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+
+    // Invalid. Lifetime of `inner` is too short. Rust don't like that.
+    // &mut inner.tasks[current].memory_set
+
+    let memory_set = &mut inner.tasks[current].memory_set as *mut MemorySet;
+    unsafe { &mut *memory_set }
+}
+
+/// Get the current 'Running' task's syscall count for a specific syscall id.
+pub fn get_current_task_syscall_count(syscall_id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .syscall_count_record
+        .get(&syscall_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Set the current 'Running' task's syscall count for a specific syscall id.
+pub fn set_current_task_syscall_count(syscall_id: usize, count: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .syscall_count_record
+        .insert(syscall_id, count);
 }
