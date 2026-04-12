@@ -4,7 +4,7 @@ use super::UPSafeCell;
 use crate::task::TaskControlBlock;
 use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
 use crate::task::{current_task, wakeup_task};
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 /// Mutex trait
 pub trait Mutex: Sync + Send {
@@ -12,6 +12,10 @@ pub trait Mutex: Sync + Send {
     fn lock(&self);
     /// Unlock the mutex
     fn unlock(&self);
+    /// For deadlock detection
+    fn is_locked(&self) -> bool;
+    /// Get wait queue
+    fn get_wait_queue(&self) -> Vec<Arc<TaskControlBlock>>;
 }
 
 /// Spinlock Mutex struct
@@ -49,6 +53,14 @@ impl Mutex for MutexSpin {
         trace!("kernel: MutexSpin::unlock");
         let mut locked = self.locked.exclusive_access();
         *locked = false;
+    }
+
+    fn is_locked(&self) -> bool {
+        *self.locked.exclusive_access()
+    }
+
+    fn get_wait_queue(&self) -> Vec<Arc<TaskControlBlock>> {
+        Vec::new()
     }
 }
 
@@ -101,5 +113,14 @@ impl Mutex for MutexBlocking {
         } else {
             mutex_inner.locked = false;
         }
+    }
+
+    fn is_locked(&self) -> bool {
+        self.inner.exclusive_access().locked
+    }
+
+    fn get_wait_queue(&self) -> Vec<Arc<TaskControlBlock>> {
+        let inner = self.inner.exclusive_access();
+        inner.wait_queue.iter().cloned().collect()
     }
 }

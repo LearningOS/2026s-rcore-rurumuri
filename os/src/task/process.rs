@@ -49,6 +49,12 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection enabled
+    pub deadlock_detect: bool,
+    /// semaphore allocation matrix: semaphore_allocation[tid][sem_id]
+    pub semaphore_allocation: Vec<Vec<isize>>,
+    /// mutex allocation matrix: mutex_allocation[tid][mutex_id] (0 or 1)
+    pub mutex_allocation: Vec<Vec<isize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -72,7 +78,21 @@ impl ProcessControlBlockInner {
     }
     /// deallocate a task id
     pub fn dealloc_tid(&mut self, tid: usize) {
-        self.task_res_allocator.dealloc(tid)
+        self.task_res_allocator.dealloc(tid);
+        if tid < self.semaphore_allocation.len() {
+            if let Some(row) = self.semaphore_allocation.get_mut(tid) {
+                for v in row.iter_mut() {
+                    *v = 0;
+                }
+            }
+        }
+        if tid < self.mutex_allocation.len() {
+            if let Some(row) = self.mutex_allocation.get_mut(tid) {
+                for v in row.iter_mut() {
+                    *v = 0;
+                }
+            }
+        }
     }
     /// the count of tasks(threads) in this process
     pub fn thread_count(&self) -> usize {
@@ -81,6 +101,128 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    pub fn ensure_deadlock_matrices(&mut self) {
+        let n = self.tasks.len();
+        let m_sem = self.semaphore_list.len();
+        let m_mutex = self.mutex_list.len();
+        // resize semaphore allocation
+        while self.semaphore_allocation.len() < n {
+            self.semaphore_allocation.push(vec![0isize; m_sem]);
+        }
+        for row in &mut self.semaphore_allocation {
+            row.resize(m_sem, 0);
+        }
+        // resize mutex allocation
+        while self.mutex_allocation.len() < n {
+            self.mutex_allocation.push(vec![0isize; m_mutex]);
+        }
+        for row in &mut self.mutex_allocation {
+            row.resize(m_mutex, 0);
+        }
+    }
+
+    pub fn enable_deadlock_detect(&mut self, enabled: bool) {
+        self.deadlock_detect = enabled;
+        self.ensure_deadlock_matrices();
+    }
+
+    fn is_safe(
+        available: Vec<isize>,
+        allocation: &[Vec<isize>],
+        need: &[Vec<isize>],
+        n: usize,
+        m: usize,
+    ) -> bool {
+        let mut work = available;
+        let mut finish = vec![false; n];
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for i in 0..n {
+                if !finish[i] {
+                    let mut can = true;
+                    for j in 0..m {
+                        if j >= need[i].len() || need[i][j] > work[j] {
+                            can = false;
+                            break;
+                        }
+                    }
+                    if can {
+                        for j in 0..m {
+                            if j < allocation[i].len() {
+                                work[j] += allocation[i][j];
+                            }
+                        }
+                        finish[i] = true;
+                        progress = true;
+                    }
+                }
+            }
+        }
+        finish.iter().all(|&f| f)
+    }
+
+    pub fn check_sem_deadlock(&self, tid: usize, sem_id: usize) -> bool {
+        let n = self.tasks.len();
+        let m = self.semaphore_list.len();
+        if tid >= n || sem_id >= m || self.semaphore_list[sem_id].is_none() {
+            return false;
+        }
+        let mut available = vec![0isize; m];
+        let mut need = vec![vec![0isize; m]; n];
+        let allocation = self.semaphore_allocation.clone();
+        for (j, sem_opt) in self.semaphore_list.iter().enumerate() {
+            if let Some(sem) = sem_opt.as_ref() {
+                let wait_queue = {
+                    let sem_inner = sem.inner.exclusive_access();
+                    available[j] = sem_inner.count.max(0isize);
+                    sem_inner.wait_queue.iter().cloned().collect::<Vec<_>>()
+                };
+                for task in wait_queue {
+                    let task_inner = task.inner_exclusive_access();
+                    if let Some(res) = &task_inner.res {
+                        let wtid = res.tid;
+                        if wtid < n {
+                            need[wtid][j] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        need[tid][sem_id] = 1;
+        let safe = Self::is_safe(available, &allocation, &need, n, m);
+        !safe
+    }
+
+    pub fn check_mutex_deadlock(&self, tid: usize, mutex_id: usize) -> bool {
+        let n = self.tasks.len();
+        let m = self.mutex_list.len();
+        if tid >= n || mutex_id >= m || self.mutex_list[mutex_id].is_none() {
+            return false;
+        }
+        let mut available = vec![0isize; m];
+        let mut need = vec![vec![0isize; m]; n];
+        let allocation = self.mutex_allocation.clone();
+        for (j, mutex_opt) in self.mutex_list.iter().enumerate() {
+            if let Some(mutex) = mutex_opt.as_ref() {
+                available[j] = if mutex.is_locked() { 0 } else { 1 };
+                let wait_queue = mutex.get_wait_queue();
+                for task in wait_queue {
+                    let task_inner = task.inner_exclusive_access();
+                    if let Some(res) = &task_inner.res {
+                        let wtid = res.tid;
+                        if wtid < n {
+                            need[wtid][j] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        need[tid][mutex_id] = 1;
+        let safe = Self::is_safe(available, &allocation, &need, n, m);
+        !safe
     }
 }
 
@@ -119,6 +261,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    semaphore_allocation: Vec::new(),
+                    mutex_allocation: Vec::new(),
                 })
             },
         });
@@ -144,6 +289,7 @@ impl ProcessControlBlock {
         // add main thread to the process
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
+        process_inner.ensure_deadlock_matrices();
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // add main thread to scheduler
@@ -245,6 +391,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    semaphore_allocation: Vec::new(),
+                    mutex_allocation: Vec::new(),
                 })
             },
         });
@@ -267,6 +416,7 @@ impl ProcessControlBlock {
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
+        child_inner.ensure_deadlock_matrices();
         drop(child_inner);
         // modify kstack_top in trap_cx of this thread
         let task_inner = task.inner_exclusive_access();
