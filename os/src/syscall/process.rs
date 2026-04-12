@@ -1,3 +1,5 @@
+use core::ptr::write_volatile;
+
 use crate::{
     fs::{open_file, OpenFlags},
     mm::{translated_ref, translated_refmut, translated_str},
@@ -156,7 +158,44 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let ms = crate::timer::get_time_ms();
+    let timeval = TimeVal {
+        sec: ms / 1000,
+        usec: (ms % 1000) * 1000,
+    };
+    let byte_buffer = crate::mm::translated_byte_buffer(
+        crate::task::current_user_token(),
+        _ts as *const u8,
+        core::mem::size_of::<TimeVal>(),
+    );
+    if byte_buffer.len() == 1 {
+        // TimeVal is from one page
+        let ptr = byte_buffer[0].as_ptr() as *mut TimeVal;
+        unsafe {
+            write_volatile(ptr, timeval);
+        }
+    } else {
+        // TimeVal is splitted by two pages
+        let ptr1 = byte_buffer[0].as_ptr() as *mut TimeVal;
+        let ptr2 = byte_buffer[1].as_ptr() as *mut TimeVal;
+        unsafe {
+            write_volatile(
+                ptr1,
+                TimeVal {
+                    sec: timeval.sec,
+                    usec: 0,
+                },
+            );
+            write_volatile(
+                ptr2,
+                TimeVal {
+                    sec: 0,
+                    usec: timeval.usec,
+                },
+            );
+        }
+    };
+    0
 }
 
 /// mmap syscall
